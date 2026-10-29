@@ -30,8 +30,8 @@ class MockMatchingRepository implements MatchingRepository {
   ];
 
   private jobs: JobRecord[] = [
-    { id: 1, title: 'Backend Detective', minExperience: 3, tagline: 'We have a bug.' },
-    { id: 3, title: 'Developer Relations Lead', minExperience: 2, tagline: 'Explain complex things.' },
+    { id: 1, title: 'Backend Detective', minExperience: 3, tagline: 'We have a bug.', availabilityRequirement: null },
+    { id: 3, title: 'Developer Relations Lead', minExperience: 2, tagline: 'Explain complex things.', availabilityRequirement: null },
   ];
 
   private candidateSkillsMap: Record<number, string[]> = {
@@ -53,6 +53,10 @@ class MockMatchingRepository implements MatchingRepository {
     return this.jobSkillsMap[jobId] ?? [];
   }
 
+  async getJobPreferences(): Promise<[]> {
+    return [];
+  }
+
   async getCandidateById(candidateId: number): Promise<CandidateRecord | null> {
     return this.candidates.find(c => c.id === candidateId) ?? null;
   }
@@ -61,10 +65,15 @@ class MockMatchingRepository implements MatchingRepository {
     return this.candidateSkillsMap[candidateId] ?? [];
   }
 
+  async getCandidatePreferences(): Promise<[]> {
+    return [];
+  }
+
   async getAllCandidatesWithSkills(): Promise<CandidateWithSkills[]> {
     return this.candidates.map(c => ({
       ...c,
       skills: this.candidateSkillsMap[c.id] ?? [],
+      preferences: [],
     }));
   }
 
@@ -72,6 +81,7 @@ class MockMatchingRepository implements MatchingRepository {
     return this.jobs.map(j => ({
       ...j,
       requiredSkills: this.jobSkillsMap[j.id] ?? [],
+      preferences: [],
     }));
   }
 
@@ -84,6 +94,49 @@ class MockMatchingRepository implements MatchingRepository {
   }
 }
 
+class RankingTestRepository extends MockMatchingRepository {
+  override async getJobById(jobId: number): Promise<JobRecord | null> {
+    const job = await super.getJobById(jobId);
+    return job ? { ...job, minExperience: 5 } : null;
+  }
+
+  override async getJobRequiredSkills(jobId: number): Promise<string[]> {
+    return jobId === 1 ? Array.from({ length: 12 }, (_, index) => `required-${index + 1}`) : [];
+  }
+
+  override async getAllCandidatesWithSkills(): Promise<CandidateWithSkills[]> {
+    return [
+      { id: 20, name: 'Higher precise score', experience: 4.999, availability: 'Immediate', quirk: '', skills: [], preferences: [] },
+      { id: 10, name: 'Lower precise score', experience: 4.998, availability: 'Immediate', quirk: '', skills: [], preferences: [] },
+      { id: 30, name: 'More matched skills', experience: 4, availability: 'Immediate', quirk: '', skills: ['required-1'], preferences: [] },
+      { id: 11, name: 'Lower ID tie', experience: 5, availability: 'Immediate', quirk: '', skills: [], preferences: [] },
+      { id: 12, name: 'Higher ID tie', experience: 5, availability: 'Immediate', quirk: '', skills: [], preferences: [] },
+    ];
+  }
+}
+
+class JobRankingTestRepository extends MockMatchingRepository {
+  override async getCandidateById(candidateId: number): Promise<CandidateRecord | null> {
+    const candidate = await super.getCandidateById(candidateId);
+    return candidate ? { ...candidate, experience: 4 } : null;
+  }
+
+  override async getCandidateSkills(): Promise<string[]> {
+    return ['special'];
+  }
+
+  override async getAllJobsWithSkills(): Promise<JobWithSkills[]> {
+    const requiredSkills = Array.from({ length: 12 }, (_, index) => `required-${index + 1}`);
+    return [
+      { id: 20, title: 'Higher precise score', minExperience: 1000, tagline: '', availabilityRequirement: null, requiredSkills, preferences: [] },
+      { id: 10, title: 'Lower precise score', minExperience: 1001, tagline: '', availabilityRequirement: null, requiredSkills, preferences: [] },
+      { id: 30, title: 'More matched skills', minExperience: 5, tagline: '', availabilityRequirement: null, requiredSkills: ['special', ...requiredSkills.slice(1)], preferences: [] },
+      { id: 11, title: 'Lower ID tie', minExperience: 4, tagline: '', availabilityRequirement: null, requiredSkills: [], preferences: [] },
+      { id: 12, title: 'Higher ID tie', minExperience: 4, tagline: '', availabilityRequirement: null, requiredSkills: [], preferences: [] },
+    ];
+  }
+}
+
 // ============================================================================
 // Test Setup
 // ============================================================================
@@ -91,7 +144,7 @@ class MockMatchingRepository implements MatchingRepository {
 function makeRequest(
   server: http.Server,
   path: string
-): Promise<{ status: number; body: unknown }> {
+): Promise<{ status: number; body: unknown; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const address = server.address();
     if (!address || typeof address === 'string') {
@@ -106,9 +159,9 @@ function makeRequest(
         res.on('data', (chunk) => { data += chunk; });
         res.on('end', () => {
           try {
-            resolve({ status: res.statusCode ?? 500, body: JSON.parse(data) });
+            resolve({ status: res.statusCode ?? 500, body: JSON.parse(data), headers: res.headers });
           } catch {
-            resolve({ status: res.statusCode ?? 500, body: data });
+            resolve({ status: res.statusCode ?? 500, body: data, headers: res.headers });
           }
         });
       }
@@ -148,49 +201,59 @@ describe('API Endpoints', () => {
 
   describe('GET /jobs/:id/matches', () => {
     it('returns ranked candidates for a valid job', async () => {
-      const { status, body } = await makeRequest(server, '/jobs/1/matches');
+      const { status, body, headers } = await makeRequest(server, '/jobs/1/matches');
       assert.equal(status, 200);
 
-      const data = body as any;
-      assert.equal(data.jobId, 1);
-      assert.equal(data.jobTitle, 'Backend Detective');
-      assert.ok(Array.isArray(data.matches));
-      assert.ok(data.matches.length > 0);
-
-      // Sherlock (ID 1) should be ranked first — perfect match
-      assert.equal(data.matches[0].candidateId, 1);
-      assert.equal(data.matches[0].score, 100);
-      assert.equal(data.matches[0].scoreBreakdown.skillScore, 70);
-      assert.equal(data.matches[0].scoreBreakdown.experienceScore, 30);
+      assert.match(String(headers['content-type']), /^text\/html/);
+      assert.ok(typeof body === 'string');
+      assert.match(body, /<h1>Candidates for Backend Detective<\/h1>/);
+      assert.match(body, /<th scope="col">Rank<\/th>/);
+      assert.match(body, /<td>1<\/td><td>Backend Detective<\/td><td>1<\/td><td>1<\/td><td>Sherlock H\.<\/td><td>100<\/td>/);
     });
 
-    it('returns correct score breakdown', async () => {
+    it('includes the assignment-required fields for each candidate', async () => {
       const { body } = await makeRequest(server, '/jobs/1/matches');
-      const data = body as any;
-      const sherlock = data.matches.find((m: any) => m.candidateId === 1);
-
-      assert.ok(sherlock);
-      assert.equal(sherlock.skills.required, 3);
-      assert.equal(sherlock.skills.exactMatches, 3);
-      assert.equal(sherlock.skills.matched, 3);
-      assert.equal(sherlock.skills.missingSkills.length, 0);
-      assert.equal(sherlock.experience.meetsRequirement, true);
+      assert.ok(typeof body === 'string');
+      assert.match(body, /<th scope="col">Candidate ID<\/th>/);
+      assert.match(body, /<td>Sherlock H\.<\/td><td>100<\/td><td>Matches all 3 required skills/);
     });
 
     it('ranks candidates with no skill overlap last', async () => {
       const { body } = await makeRequest(server, '/jobs/1/matches');
-      const data = body as any;
 
       // Ron S. (ID 5) has no matching skills
-      const ron = data.matches.find((m: any) => m.candidateId === 5);
-      assert.ok(ron);
-      assert.equal(ron.skills.matched, 0);
-      assert.ok(ron.score < 100);
+      assert.ok(typeof body === 'string');
+      const sherlockIdx = body.indexOf('<td>Sherlock H.</td>');
+      const ronIdx = body.indexOf('<td>Ron S.</td>');
+      assert.ok(sherlockIdx > 0);
+      assert.ok(ronIdx > sherlockIdx);
+    });
 
-      // Ron should be ranked after Sherlock
-      const sherlockIdx = data.matches.findIndex((m: any) => m.candidateId === 1);
-      const ronIdx = data.matches.findIndex((m: any) => m.candidateId === 5);
-      assert.ok(sherlockIdx < ronIdx);
+    it('uses full precision, matched skills, then lower ID to break ties', async () => {
+      const semanticService = new SemanticMatchingService(
+        new FakeEmbeddingProvider(),
+        { enabled: false, similarityThreshold: 0.82, cacheMaxSize: 100 }
+      );
+      const app = createApp(new MatchingService(new RankingTestRepository() as any, semanticService));
+      const rankingServer = await new Promise<http.Server>((resolve) => {
+        const instance = app.listen(0, () => resolve(instance));
+      });
+
+      try {
+        const { body } = await makeRequest(rankingServer, '/jobs/1/matches');
+        assert.ok(typeof body === 'string');
+
+        const positions = [30, 11, 12, 20, 10].map(id =>
+          body.indexOf(`<td>${id}</td>`)
+        );
+        assert.ok(positions.every(position => position >= 0));
+        assert.deepEqual(positions, [...positions].sort((a, b) => a - b));
+
+        assert.match(body, /<td>20<\/td><td>Higher precise score<\/td><td>40<\/td>/);
+        assert.match(body, /<td>10<\/td><td>Lower precise score<\/td><td>40<\/td>/);
+      } finally {
+        await new Promise<void>((resolve) => rankingServer.close(() => resolve()));
+      }
     });
 
     it('returns 400 for invalid job ID', async () => {
@@ -230,20 +293,47 @@ describe('API Endpoints', () => {
       const { status, body } = await makeRequest(server, '/candidates/1/matches');
       assert.equal(status, 200);
 
-      const data = body as any;
-      assert.equal(data.candidateId, 1);
-      assert.equal(data.candidateName, 'Sherlock H.');
-      assert.ok(Array.isArray(data.matches));
-      assert.ok(data.matches.length > 0);
+      assert.ok(typeof body === 'string');
+      assert.match(body, /<h1>Jobs for Sherlock H\.<\/h1>/);
+      assert.match(body, /<th scope="col">Job Title<\/th>/);
+      assert.match(body, /<td>1<\/td><td>Sherlock H\.<\/td><td>1<\/td><td>1<\/td><td>Backend Detective<\/td><td>100<\/td>/);
     });
 
     it('returns correct job match for Sherlock → Backend Detective', async () => {
       const { body } = await makeRequest(server, '/candidates/1/matches');
-      const data = body as any;
+      assert.ok(typeof body === 'string');
+      assert.match(body, /<td>Backend Detective<\/td><td>100<\/td><td>Matches all 3 required skills/);
+    });
 
-      const backendDetective = data.matches.find((m: any) => m.jobId === 1);
-      assert.ok(backendDetective);
-      assert.equal(backendDetective.score, 100);
+    it('uses full precision, matched skills, then lower ID to break job ties', async () => {
+      const semanticService = new SemanticMatchingService(
+        new FakeEmbeddingProvider(),
+        { enabled: false, similarityThreshold: 0.82, cacheMaxSize: 100 }
+      );
+      const app = createApp(new MatchingService(new JobRankingTestRepository() as any, semanticService));
+      const rankingServer = await new Promise<http.Server>((resolve) => {
+        const instance = app.listen(0, () => resolve(instance));
+      });
+
+      try {
+        const { body } = await makeRequest(rankingServer, '/candidates/1/matches');
+        assert.ok(typeof body === 'string');
+
+        const positions = [
+          'More matched skills',
+          'Lower ID tie',
+          'Higher ID tie',
+          'Higher precise score',
+          'Lower precise score',
+        ].map(title => body.indexOf(`<td>${title}</td>`));
+        assert.ok(positions.every(position => position >= 0));
+        assert.deepEqual(positions, [...positions].sort((a, b) => a - b));
+
+        assert.match(body, /<td>Higher precise score<\/td><td>15\.1<\/td>/);
+        assert.match(body, /<td>Lower precise score<\/td><td>15\.1<\/td>/);
+      } finally {
+        await new Promise<void>((resolve) => rankingServer.close(() => resolve()));
+      }
     });
 
     it('returns 400 for invalid candidate ID', async () => {
@@ -265,30 +355,24 @@ describe('API Endpoints', () => {
     it('same candidate-job pair has same score from both endpoints', async () => {
       const { body: jobMatches } = await makeRequest(server, '/jobs/1/matches');
       const { body: candidateMatches } = await makeRequest(server, '/candidates/1/matches');
-
-      const fromJob = (jobMatches as any).matches.find((m: any) => m.candidateId === 1);
-      const fromCandidate = (candidateMatches as any).matches.find((m: any) => m.jobId === 1);
-
-      assert.equal(fromJob.score, fromCandidate.score);
-      assert.equal(fromJob.scoreBreakdown.skillScore, fromCandidate.scoreBreakdown.skillScore);
-      assert.equal(
-        fromJob.scoreBreakdown.experienceScore,
-        fromCandidate.scoreBreakdown.experienceScore
-      );
+      assert.ok(typeof jobMatches === 'string');
+      assert.ok(typeof candidateMatches === 'string');
+      assert.match(jobMatches, /<td>Backend Detective<\/td><td>1<\/td><td>1<\/td><td>Sherlock H\.<\/td><td>100<\/td><td>([^<]+)<\/td>/);
+      assert.match(candidateMatches, /<td>1<\/td><td>Sherlock H\.<\/td><td>1<\/td><td>1<\/td><td>Backend Detective<\/td><td>100<\/td><td>([^<]+)<\/td>/);
     });
   });
 
   // --------------------------------------------------------------------------
-  // Semantic matching fallback
+  // Semantic matching output
   // --------------------------------------------------------------------------
 
-  describe('Semantic matching status', () => {
-    it('reports semantic matching as disabled when configured off', async () => {
-      const { body } = await makeRequest(server, '/jobs/1/matches');
-      const data = body as any;
-      const match = data.matches[0];
-
-      assert.equal(match.semanticMatching.status, 'disabled');
+  describe('Match response shape', () => {
+    it('does not expose internal scoring details', async () => {
+      const { body, headers } = await makeRequest(server, '/jobs/1/matches');
+      assert.equal(String(headers['content-type']).split(';')[0], 'text/html');
+      assert.ok(typeof body === 'string');
+      assert.match(body, /<table>/);
+      assert.doesNotMatch(body, /scoreBreakdown|semanticMatching|availabilityAlignment|preferenceAlignment/);
     });
   });
 
@@ -358,19 +442,10 @@ describe('Semantic matching failure fallback', () => {
     const { status, body } = await makeRequest(server, '/jobs/1/matches');
     assert.equal(status, 200);
 
-    const data = body as any;
-    assert.ok(Array.isArray(data.matches));
+    assert.ok(typeof body === 'string');
 
-    // Should still return results using exact matching
-    const sherlock = data.matches.find((m: any) => m.candidateId === 1);
-    assert.ok(sherlock);
-    assert.equal(sherlock.score, 100); // All exact matches
-
-    // Candidate with unresolved skills attempted semantic matching, which failed
-    const ron = data.matches.find((m: any) => m.candidateId === 5);
-    assert.ok(ron);
-    assert.equal(ron.semanticMatching.status, 'unavailable');
+    // The failed provider does not prevent exact matches or the HTML response.
+    assert.match(body, /<td>Backend Detective<\/td><td>1<\/td><td>1<\/td><td>Sherlock H\.<\/td><td>100<\/td>/);
+    assert.match(body, /<td>Ron S\.<\/td>/);
   });
 });
-
-

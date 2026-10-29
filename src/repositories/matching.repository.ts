@@ -25,14 +25,29 @@ export interface JobRecord {
   title: string;
   minExperience: number;
   tagline: string | null;
+  availabilityRequirement: string | null;
+}
+
+export type PreferenceDimension = 'work_arrangement' | 'schedule' | 'travel';
+
+export interface CandidatePreference {
+  dimension: PreferenceDimension;
+  value: string;
+}
+
+export interface JobPreference {
+  dimension: PreferenceDimension;
+  value: string;
 }
 
 export interface CandidateWithSkills extends CandidateRecord {
   skills: string[];
+  preferences: CandidatePreference[];
 }
 
 export interface JobWithSkills extends JobRecord {
   requiredSkills: string[];
+  preferences: JobPreference[];
 }
 
 // ============================================================================
@@ -52,11 +67,18 @@ interface JobRow extends RowDataPacket {
   title: string;
   min_experience: number;
   tagline: string | null;
+  availability_requirement: string | null;
 }
 
 interface SkillRow extends RowDataPacket {
   entity_id: number;
   skill_name: string;
+}
+
+interface PreferenceRow extends RowDataPacket {
+  entity_id: number;
+  dimension: PreferenceDimension;
+  value: string;
 }
 
 // ============================================================================
@@ -76,9 +98,10 @@ export class MatchingRepository {
    */
   async getJobById(jobId: number): Promise<JobRecord | null> {
     const [rows] = await this.pool.execute<JobRow[]>(
-      `SELECT id, title, min_experience, tagline
-       FROM jobs
-       WHERE id = ?`,
+      `SELECT j.id, j.title, j.min_experience, j.tagline,
+              j.availability_requirement
+       FROM jobs j
+       WHERE j.id = ?`,
       [jobId]
     );
 
@@ -90,7 +113,19 @@ export class MatchingRepository {
       title: row.title,
       minExperience: row.min_experience,
       tagline: row.tagline,
+      availabilityRequirement: row.availability_requirement,
     };
+  }
+
+  async getJobPreferences(jobId: number): Promise<JobPreference[]> {
+    const [rows] = await this.pool.execute<PreferenceRow[]>(
+      `SELECT dimension, value
+       FROM job_preferences
+       WHERE job_id = ?
+       ORDER BY dimension`,
+      [jobId]
+    );
+    return rows.map(({ dimension, value }) => ({ dimension, value }));
   }
 
   /**
@@ -153,6 +188,17 @@ export class MatchingRepository {
     return rows.map(r => r.skill_name);
   }
 
+  async getCandidatePreferences(candidateId: number): Promise<CandidatePreference[]> {
+    const [rows] = await this.pool.execute<PreferenceRow[]>(
+      `SELECT dimension, value
+       FROM candidate_preferences
+       WHERE candidate_id = ?
+       ORDER BY dimension`,
+      [candidateId]
+    );
+    return rows.map(({ dimension, value }) => ({ dimension, value }));
+  }
+
   // --------------------------------------------------------------------------
   // Batch Operations (for matching endpoints)
   // --------------------------------------------------------------------------
@@ -179,12 +225,25 @@ export class MatchingRepository {
        ORDER BY cs.candidate_id, s.name`
     );
 
+    const [preferenceRows] = await this.pool.execute<PreferenceRow[]>(
+      `SELECT candidate_id AS entity_id, dimension, value
+       FROM candidate_preferences
+       ORDER BY candidate_id, dimension`
+    );
+
     // Group skills by candidate ID
     const skillsByCandidate = new Map<number, string[]>();
     for (const row of skillRows) {
       const skills = skillsByCandidate.get(row.entity_id) ?? [];
       skills.push(row.skill_name);
       skillsByCandidate.set(row.entity_id, skills);
+    }
+
+    const preferencesByCandidate = new Map<number, CandidatePreference[]>();
+    for (const row of preferenceRows) {
+      const preferences = preferencesByCandidate.get(row.entity_id) ?? [];
+      preferences.push({ dimension: row.dimension, value: row.value });
+      preferencesByCandidate.set(row.entity_id, preferences);
     }
 
     // Combine candidates with their skills
@@ -195,6 +254,7 @@ export class MatchingRepository {
       availability: c.availability,
       quirk: c.quirk,
       skills: skillsByCandidate.get(c.id) ?? [],
+      preferences: preferencesByCandidate.get(c.id) ?? [],
     }));
   }
 
@@ -205,9 +265,10 @@ export class MatchingRepository {
   async getAllJobsWithSkills(): Promise<JobWithSkills[]> {
     // Query 1: Get all jobs
     const [jobRows] = await this.pool.execute<JobRow[]>(
-      `SELECT id, title, min_experience, tagline
-       FROM jobs
-       ORDER BY id`
+      `SELECT j.id, j.title, j.min_experience, j.tagline,
+              j.availability_requirement
+       FROM jobs j
+       ORDER BY j.id`
     );
 
     if (jobRows.length === 0) return [];
@@ -220,6 +281,12 @@ export class MatchingRepository {
        ORDER BY jrs.job_id, s.name`
     );
 
+    const [preferenceRows] = await this.pool.execute<PreferenceRow[]>(
+      `SELECT job_id AS entity_id, dimension, value
+       FROM job_preferences
+       ORDER BY job_id, dimension`
+    );
+
     // Group skills by job ID
     const skillsByJob = new Map<number, string[]>();
     for (const row of skillRows) {
@@ -228,13 +295,22 @@ export class MatchingRepository {
       skillsByJob.set(row.entity_id, skills);
     }
 
+    const preferencesByJob = new Map<number, JobPreference[]>();
+    for (const row of preferenceRows) {
+      const preferences = preferencesByJob.get(row.entity_id) ?? [];
+      preferences.push({ dimension: row.dimension, value: row.value });
+      preferencesByJob.set(row.entity_id, preferences);
+    }
+
     // Combine jobs with their required skills
     return jobRows.map(j => ({
       id: j.id,
       title: j.title,
       minExperience: j.min_experience,
       tagline: j.tagline,
+      availabilityRequirement: j.availability_requirement,
       requiredSkills: skillsByJob.get(j.id) ?? [],
+      preferences: preferencesByJob.get(j.id) ?? [],
     }));
   }
 
@@ -260,4 +336,3 @@ export class MatchingRepository {
     return rows.length > 0;
   }
 }
-

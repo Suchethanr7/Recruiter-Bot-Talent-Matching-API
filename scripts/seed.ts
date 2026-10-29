@@ -11,8 +11,31 @@
 
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
-import mysql from 'mysql2/promise';
+import mysql, { type RowDataPacket } from 'mysql2/promise';
 import { loadConfig } from '../src/config/env.js';
+
+interface ColumnCountRow extends RowDataPacket {
+  count: number;
+}
+
+async function ensureColumn(
+  connection: mysql.Connection,
+  database: string,
+  table: string,
+  column: string
+): Promise<void> {
+  const [rows] = await connection.execute<ColumnCountRow[]>(
+    `SELECT COUNT(*) AS count
+     FROM information_schema.columns
+     WHERE table_schema = ? AND table_name = ? AND column_name = ?`,
+    [database, table, column]
+  );
+
+  if (rows[0]!.count === 0) {
+    await connection.execute(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` JSON NULL`);
+    console.log(`✓ Added ${table}.${column} column`);
+  }
+}
 
 async function seed(): Promise<void> {
   const config = loadConfig();
@@ -41,6 +64,8 @@ async function seed(): Promise<void> {
     const schemaPath = resolve(process.cwd(), 'sql', 'schema.sql');
     const schemaSql = readFileSync(schemaPath, 'utf-8');
     await connection.query(schemaSql);
+    await ensureColumn(connection, config.db.database, 'candidates', 'traits');
+    await ensureColumn(connection, config.db.database, 'jobs', 'culture_keywords');
     console.log('✓ Schema tables created');
 
     // Read and execute seed SQL
@@ -55,10 +80,8 @@ async function seed(): Promise<void> {
     const [skillRows] = await connection.execute('SELECT COUNT(*) as count FROM skills');
     const [csRows] = await connection.execute('SELECT COUNT(*) as count FROM candidate_skills');
     const [jrsRows] = await connection.execute('SELECT COUNT(*) as count FROM job_required_skills');
-    const [traitRows] = await connection.execute('SELECT COUNT(*) as count FROM traits');
-    const [ctRows] = await connection.execute('SELECT COUNT(*) as count FROM candidate_traits');
-    const [ckRows] = await connection.execute('SELECT COUNT(*) as count FROM culture_keywords');
-    const [jckRows] = await connection.execute('SELECT COUNT(*) as count FROM job_culture_keywords');
+    const [candidatePreferenceRows] = await connection.execute('SELECT COUNT(*) as count FROM candidate_preferences');
+    const [jobPreferenceRows] = await connection.execute('SELECT COUNT(*) as count FROM job_preferences');
 
     console.log('\n📊 Database contents:');
     console.log(`   Candidates:        ${(candidateRows as any)[0].count}`);
@@ -66,10 +89,8 @@ async function seed(): Promise<void> {
     console.log(`   Skills:            ${(skillRows as any)[0].count}`);
     console.log(`   Candidate-Skills:  ${(csRows as any)[0].count}`);
     console.log(`   Job-Required-Skills: ${(jrsRows as any)[0].count}`);
-    console.log(`   Traits:            ${(traitRows as any)[0].count}`);
-    console.log(`   Candidate-Traits:  ${(ctRows as any)[0].count}`);
-    console.log(`   Culture Keywords:  ${(ckRows as any)[0].count}`);
-    console.log(`   Job-Culture-Keywords: ${(jckRows as any)[0].count}`);
+    console.log(`   Candidate-Preferences: ${(candidatePreferenceRows as any)[0].count}`);
+    console.log(`   Job-Preferences:       ${(jobPreferenceRows as any)[0].count}`);
 
     console.log('\n✅ Seeding complete!');
   } finally {
@@ -81,4 +102,3 @@ seed().catch((error) => {
   console.error('Seeding failed:', error.message);
   process.exit(1);
 });
-

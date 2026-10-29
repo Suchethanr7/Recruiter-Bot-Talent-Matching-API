@@ -1,261 +1,120 @@
-# RecruiterFlow — Candidate Matching Engine
+# RecruiterFlow Candidate Matcher
 
-A lightweight, deterministic candidate-job matching engine built for the RecruiterFlow internship assignment. It pairs candidates with open roles using a transparent 70/30 scoring formula, handwritten MySQL queries, and an optional AI embedding layer for semantic skill matching.
+A backend API that ranks candidates for jobs (and jobs for candidates) using skills, experience, availability, and explicit work preferences. It uses Node.js, TypeScript, Express, MySQL, and optional Google Gemini/OpenAI embeddings for semantic skill matching.
 
-Built with **Node.js LTS**, **TypeScript (strict)**, **Express**, and **MySQL 8.x**. No ORMs, query builders, or heavy frameworks.
+## Run locally
 
----
+Requirements: Node.js 20+, MySQL 8+, and an available MySQL account.
 
-## Quick Start
-
-### 1. Install dependencies
-```bash
+```powershell
 npm install
+Copy-Item .env.example .env
 ```
 
-### 2. Configure environment
-Create a `.env` file from the example:
-```bash
-cp .env.example .env
-```
-Update your MySQL credentials in `.env`:
-```ini
-DB_HOST=localhost
-DB_PORT=3306
-DB_USER=root
-DB_PASSWORD=your_password
-DB_NAME=recruiterflow
+Edit `.env` and set `DB_USER`, `DB_PASSWORD`, and `DB_NAME=recruiterflow`. To enable semantic skill matching, keep `SEMANTIC_MATCHING_ENABLED=true`, set `EMBEDDING_PROVIDER=google-ai`, and add a valid Google AI key to `GOOGLE_AI_API_KEY`. Without a working key, the API still runs with exact skill matching.
 
-# Optional: Enable semantic skill matching (works offline with exact matching by default)
-SEMANTIC_MATCHING_ENABLED=false
-GOOGLE_AI_API_KEY=your_key_here
-```
+With MySQL running:
 
-### 3. Seed the database
-Make sure MySQL is running, then run:
-```bash
+```powershell
 npm run seed
-```
-This script creates the database and tables, then idempotently seeds all 15 supplied candidates and 6 jobs without creating duplicates on rerun.
-
-### 4. Start the server
-```bash
-# Development (with live reload)
 npm run dev
-
-# Or build and run production
-npm run build
-npm start
-```
-The server starts at `http://localhost:3000`.
-
----
-
-## API Endpoints & Example Requests
-
-### `GET /jobs/:id/matches`
-Ranks all candidates for a specific job posting.
-
-```bash
-curl http://localhost:3000/jobs/1/matches
 ```
 
-**Example response:**
-```json
-{
-  "jobId": 1,
-  "jobTitle": "Backend Detective",
-  "matches": [
-    {
-      "candidateId": 1,
-      "candidateName": "Sherlock H.",
-      "score": 100,
-      "scoreBreakdown": {
-        "skillScore": 70,
-        "experienceScore": 30
-      },
-      "skills": {
-        "required": 3,
-        "exactMatches": 3,
-        "semanticMatches": 0,
-        "matched": 3,
-        "matchedSkills": [
-          { "requiredSkill": "deduction", "candidateSkill": "deduction", "matchType": "exact" },
-          { "requiredSkill": "pattern-recognition", "candidateSkill": "pattern-recognition", "matchType": "exact" },
-          { "requiredSkill": "forensics", "candidateSkill": "forensics", "matchType": "exact" }
-        ],
-        "missingSkills": []
-      },
-      "experience": {
-        "candidateYears": 8,
-        "minimumRequiredYears": 3,
-        "meetsRequirement": true
-      },
-      "semanticMatching": {
-        "status": "disabled",
-        "used": false
-      },
-      "reason": "Matches all 3 required skills and meets the experience requirement."
-    }
-  ]
-}
+Keep the server terminal open. Try these in another PowerShell window:
+
+```powershell
+Invoke-RestMethod http://localhost:3000/health
 ```
 
-### `GET /candidates/:id/matches`
-Ranks all jobs for a specific candidate using the identical algorithm.
+Open `http://localhost:3000/jobs/1/matches` or `http://localhost:3000/candidates/1/matches` in a browser to view the ranked results as HTML tables.
 
-```bash
-curl http://localhost:3000/candidates/1/matches
+`npm run seed` creates/upgrades the schema, then inserts or updates the 15 supplied candidates and 6 jobs. It preserves their skills, experience, availability, traits, quirks, required skills, culture keywords, and taglines. It is safe to rerun and does not delete existing records. Stop the server with Ctrl+C.
+
+## What the API does
+
+- `GET /health` — verifies the HTTP server is responding.
+- `GET /jobs/:id/matches` — ranks candidates for a job.
+- `GET /candidates/:id/matches` — ranks jobs for a candidate.
+
+The match endpoints return HTML pages with ranked-results tables. The job endpoint includes job ID/title and, for each ranked candidate, rank, candidate ID/name, score, and reason. The candidate endpoint shows the corresponding candidate ID/name and ranked jobs. Results rank by full-precision score, then number of matched skills, then ascending candidate/job ID; display rounding does not change order. Invalid IDs return 400; nonexistent records return 404.
+
+Example job match table:
+
+```html
+<table>
+  <thead>
+    <tr>
+      <th>Job ID</th><th>Job Title</th><th>Rank</th>
+      <th>Candidate ID</th><th>Candidate Name</th><th>Score</th><th>Reason</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td><td>Backend Detective</td><td>1</td>
+      <td>1</td><td>Sherlock H.</td><td>100</td>
+      <td>Matches all 3 required skills and meets the experience requirement.</td>
+    </tr>
+  </tbody>
+</table>
 ```
 
-Both endpoints return:
-- **`score`**: Overall match score bounded between 0 and 100.
-- **`scoreBreakdown`**: Exact points earned from skills vs experience.
-- **`skills`**: Counts and names of matched, missing, and semantically mapped skills.
-- **`experience`**: Candidate years vs minimum requirement.
-- **`reason`**: Clear, human-readable sentence explaining the score.
+## Scoring
 
----
+| Component | Maximum | Rule |
+|---|---:|---|
+| Skills | 60 | 60 × matched required skills ÷ total required skills |
+| Experience | 25 | 25 × min(candidate years ÷ job minimum years, 1) |
+| Availability | 10 | Full points if candidate meets the job’s start-time requirement; otherwise 0 |
+| Preferences | 5 | Divided evenly over comparable work arrangement, schedule, and travel preferences |
 
-## How Matching Works
+Availability uses `Immediate`, `2 weeks`, and `Not looking` for candidates; jobs can require `immediate`, `within_2_weeks`, or `flexible`. Missing job availability requirements are neutral.
 
-The core matching algorithm is a pure, deterministic function (`calculateMatch` in `src/services/scoring.ts`) with zero dependencies on Express, MySQL, or AI networks.
+Preferences are explicit categorical values, not personality guesses. `flexible` candidates and `flexible`/`any` job requirements are compatible; travel willingness is ordered `none` < `occasional` < `frequent`. Missing candidate responses are not mismatches; if no preferences can be compared, those points are neutral. Demo preferences in the seed file are fictional and should be replaced with real, candidate-stated data before relying on rankings.
 
-### The 70 / 30 Scoring Formula
+Skills are checked by normalized exact text first. If semantic matching is enabled, the service sends only unresolved skill labels to the configured embedding provider, compares vectors using cosine similarity, and accepts pairs at or above `SEMANTIC_SIMILARITY_THRESHOLD` (default `0.82`). Matches are one-to-one. Embeddings add skill matches; the AI provider does not set the score. Provider failures fall back to exact matching and return semantic status `unavailable`.
 
-$$\text{Total Score} = \text{Skill Score (up to 70)} + \text{Experience Score (up to 30)}$$
+## Design decisions and trade-offs
 
-1. **Skill Matching (70 points):**
-   $$\text{skillScore} = 70 \times \frac{\text{Matched Required Skills}}{\text{Total Required Skills}}$$
-   - Exact skill matches always resolve first.
-   - Each required skill can only be satisfied once (1-to-1 mapping).
-   - Extra candidate skills don't add random bonus points.
+The score gives skills 60 points and experience 25 because they are the core job requirements. Availability contributes 10 points, and the final 5 points compare explicit work arrangement, schedule, and travel preferences. Exact skill matches are preferred; optional semantic matching can recognize equivalent labels, but its threshold is configurable and should be evaluated against real skill data before production use. Ranking uses the full-precision score, then the number of matched skills, then the lower ID for deterministic ordering.
 
-2. **Experience Fit (30 points):**
-   $$\text{experienceScore} = 30 \times \min\left(\frac{\text{Candidate Experience}}{\text{Job Minimum Experience}}, 1\right)$$
-   - Candidates with less experience get partial proportional points (e.g., 2 yrs for a 3-yr job gets $30 \times \frac{2}{3} = 20$ pts).
-   - Experience points are capped at 30 so excessive tenure doesn't eclipse missing skills.
+Traits and culture keywords from the assignment are stored but do not affect ranking. This avoids inferring job fit from subjective personality labels or humorous profile descriptions. The preference score instead uses explicit, job-related values. Missing comparable preference data is treated neutrally, which avoids penalizing incomplete profiles but can give less information than a complete profile. The weights and rules are a transparent baseline, not a statistically validated hiring model.
 
-3. **Why 70/30?**
-   In software roles, competency in the actual toolchain is paramount. We weight skills at 70% to prioritize technical capability, while allocating 30% to experience to give high-aptitude early-career candidates a fair shot.
+## AI tool use
 
-4. **Deterministic Ranking:**
-   Candidates are sorted by:
-   1. `totalScore` descending (unrounded)
-   2. Matched skill count descending
-   3. Candidate ID ascending (stable tie-breaking)
+ChatGPT and GitHub Copilot were used during development to discuss and explain the design, assist with code and test changes, and improve documentation. The semantic-matching feature itself uses optional Google Gemini or OpenAI embedding APIs only for skill-label comparisons; it does not send candidate names or profile quirks to those providers. The developer remains responsible for reviewing and validating the submitted code and SQL.
 
----
+## Project map
 
-## AI-Assisted Semantic Skill Matching
+```text
+src/
+  app.ts                         HTTP routes, validation, and error responses
+  server.ts                      Startup, dependency wiring, graceful shutdown
+  config/env.ts                  .env loading and validation
+  db/pool.ts                     MySQL connection pool
+  repositories/matching.repository.ts  Parameterized database queries
+  services/matching.service.ts   Coordinates data, semantic matching, and ranking
+  services/scoring.ts            Pure deterministic scoring calculations
+  services/semantic-matching.service.ts Embedding similarity and cache
+  services/embedding-provider.ts Google/OpenAI providers and test fake
+scripts/seed.ts                  Creates schema and loads sample records
+scripts/evaluate-semantic-matching.ts Evaluates semantic threshold on labeled pairs
+sql/schema.sql                   Seven-table MySQL schema
+sql/seed.sql                     Sample candidate, job, skill, and preference data
+sql/sql_detective.sql            Separate SQL challenge queries
+tests/                           Offline scoring, semantic, and API tests
+```
 
-Text embeddings (Google Gemini `text-embedding-004` or OpenAI `text-embedding-3-small`) catch synonymous skills that differ in phrasing (e.g., `system design` $\leftrightarrow$ `systems-design`).
+The seven tables are `candidates`, `jobs`, `skills`, `candidate_skills`, `job_required_skills`, `candidate_preferences`, and `job_preferences`. Candidate traits and job culture keywords are stored as JSON arrays on their respective records, avoiding extra lookup/junction tables for small descriptive lists. The matching score does not use traits, culture keywords, humorous quirks, or job taglines; those are ingested assignment data, not scoring signals.
 
-### Conservative Design Principles
-- **Exact matches first:** Normalized string matching resolves identical skills before invoking any AI.
-- **AI never sets the score:** Embeddings only compute a cosine similarity score (between 0 and 1) between unresolved skill labels.
-- **Threshold gating (`0.82`):** Pairs below the threshold are rejected. Related but non-equivalent skills (like `sales` vs `negotiation` or `leadership` vs `mentorship`) do not match.
-- **One-to-one greedy assignment:** One candidate skill cannot satisfy multiple requirements.
-- **In-memory cache:** Skill vectors are cached in memory to minimize external network requests.
-- **Privacy by default:** Only isolated skill strings are sent to embedding providers. Candidate names, notes, and profile details never leave your infrastructure.
+## Checks and utilities
 
-### Graceful Fallback
-If the embedding API is down, times out, or has no API key, the system does not crash or return a 500. It logs a warning, falls back to exact matching, and marks `"semanticMatching": { "status": "unavailable" }` in the response.
-
----
-
-## Running the Tests
-
-All tests run completely offline without needing a running MySQL instance or an AI API key.
-
-```bash
-# Run all 80 tests
+```powershell
 npm run test:all
-
-# Run pure scoring and semantic unit tests only (62 tests)
-npm test
-
-# Run HTTP API integration tests only (18 tests)
-npm run test:api
-
-# Type-check TypeScript in strict mode
 npm run typecheck
-```
-
-### Semantic Benchmark Evaluation
-To inspect how the similarity threshold performs against 20 labeled equivalent, formatting, and unrelated skill pairs:
-```bash
+npm run build
 npm run evaluate
 ```
 
----
+Tests use a fake embedding provider and run offline. `npm run evaluate` uses the configured real embedding provider and sends only the labeled skill phrases. `sql/sql_detective.sql` is a separate assignment exercise and can be run with the MySQL CLI.
 
-## Database Design
-
-Handwritten SQL schema defined in `sql/schema.sql`:
-- **`candidates`**: ID, name, experience (years), availability, and quirky note.
-- **`jobs`**: ID, title, minimum experience, and humorous tagline.
-- **`skills`**: Master table of skills with a generated, normalized column (`LOWER(TRIM(name))`) and unique constraint to prevent duplicates.
-- **`candidate_skills`**: Composite primary key `(candidate_id, skill_id)`.
-- **`job_required_skills`**: Composite primary key `(job_id, skill_id)`.
-- **`traits` & `candidate_traits`**: Normalized candidate personality traits.
-- **`culture_keywords` & `job_culture_keywords`**: Normalized company culture attributes.
-
-All database queries in `MatchingRepository` use parameterized queries (`?`) via the `mysql2` promise pool to prevent SQL injection.
-
----
-
-## SQL Detective Challenge
-
-The assignment's analytical queries are implemented in `sql/sql_detective.sql`:
-
-1. **Question 1:** Open job postings and their responsible recruiter.
-2. **Question 2:** Distinct applicants reaching the Final interview stage per job (including jobs with 0 final applicants via outer joins).
-3. **Question 3:** Multi-job applicants with identity resolution using normalized emails (`LOWER(TRIM(a.email))`) to deduplicate candidates like "Ananya Rao".
-4. **Question 4:** Recruiter final-stage interview conversion rate (`passed / total`) for recruiters with $\ge 3$ final interviews.
-5. **Question 5:** Top recruiter per department using `RANK() OVER (PARTITION BY jp.department ORDER BY COUNT(*) DESC)` to handle ties cleanly.
-
-Run them directly in MySQL:
-```bash
-mysql -u root -p recruiterflow < sql/sql_detective.sql
-```
-
----
-
-## Project Structure
-
-```
-recruiter-bot/
-├── src/
-│   ├── app.ts                 # Express app & route mounting
-│   ├── server.ts              # Server startup & graceful shutdown
-│   ├── config/env.ts          # Environment variable validation
-│   ├── db/pool.ts             # MySQL connection pool
-│   ├── middleware/            # Centralized error handler (400, 404, 500)
-│   ├── repositories/          # Handwritten SQL data access
-│   ├── routes/                # API routes & positive-int validation
-│   └── services/
-│       ├── scoring.ts         # Pure 70/30 matching math & reason generator
-│       ├── embedding-provider.ts # AI interface (Gemini / OpenAI / Fake)
-│       ├── semantic-matching.service.ts # Cosine similarity & 1-to-1 mapping
-│       └── matching.service.ts # Shared orchestration service
-├── scripts/
-│   ├── seed.ts                # Repeatable database seeder
-│   └── evaluate-semantic-matching.ts # Threshold benchmark evaluator
-├── sql/
-│   ├── schema.sql             # Normalized DDL
-│   ├── seed.sql               # 15 candidates & 6 jobs
-│   └── sql_detective.sql      # 5 challenge queries
-└── tests/
-    ├── scoring.test.ts        # 44 unit tests
-    ├── semantic-matching.test.ts # 18 unit tests
-    └── api.test.ts            # 18 API integration tests
-```
-
----
-
-## Limitations & Future Ideas
-
-- **Vector search at scale:** For millions of jobs and skills, computing cosine similarity in-memory would bottleneck. MySQL 8.4 Vector or pgvector with approximate nearest neighbors (HNSW) would be the next step.
-- **Distributed cache:** The in-memory embedding cache is currently process-bound; production multi-instance clusters would use Redis.
-- **Availability weighting:** Candidate availability (`Immediate` vs `Not looking`) could be exposed as a configurable filter or ranking tie-breaker.
+Keep `.env` and API keys private; do not commit credentials.

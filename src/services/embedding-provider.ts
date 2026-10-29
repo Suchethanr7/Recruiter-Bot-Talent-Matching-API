@@ -39,7 +39,7 @@ export interface EmbeddingProvider {
  * Google AI embedding provider using the Gemini text-embedding model.
  *
  * Uses the REST API directly (no SDK dependency needed).
- * Model: text-embedding-004 (768 dimensions)
+ * Model: gemini-embedding-001
  *
  * Requires GOOGLE_AI_API_KEY environment variable.
  * API docs: https://ai.google.dev/gemini-api/docs/embeddings
@@ -48,7 +48,7 @@ export class GoogleAIEmbeddingProvider implements EmbeddingProvider {
   readonly name = 'google-ai';
   private readonly apiKey: string;
   private readonly timeoutMs: number;
-  private readonly model = 'text-embedding-004';
+  private readonly model = 'gemini-embedding-001';
 
   constructor(apiKey: string, timeoutMs: number = 10000) {
     this.apiKey = apiKey;
@@ -248,4 +248,3 @@ export function createEmbeddingProvider(
       return null;
   }
 }
-

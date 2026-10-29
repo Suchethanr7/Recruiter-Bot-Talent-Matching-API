@@ -13,6 +13,8 @@ import {
   calculateMatch,
   calculateSkillScore,
   calculateExperienceScore,
+  calculateAvailabilityAlignment,
+  calculatePreferenceAlignment,
   matchSkills,
   normalizeSkillLabel,
   generateReason,
@@ -48,13 +50,13 @@ describe('normalizeSkillLabel', () => {
 // ============================================================================
 
 describe('calculateSkillScore', () => {
-  it('returns 70 for complete overlap', () => {
-    assert.equal(calculateSkillScore(3, 3), 70);
+  it('returns 60 for complete overlap', () => {
+    assert.equal(calculateSkillScore(3, 3), 60);
   });
 
   it('returns proportional score for partial overlap', () => {
     const score = calculateSkillScore(2, 3);
-    assert.ok(Math.abs(score - 46.666666666666664) < 0.001);
+    assert.ok(Math.abs(score - 40) < 0.001);
   });
 
   it('returns 0 for no overlap', () => {
@@ -66,7 +68,7 @@ describe('calculateSkillScore', () => {
   });
 
   it('handles single skill', () => {
-    assert.equal(calculateSkillScore(1, 1), 70);
+    assert.equal(calculateSkillScore(1, 1), 60);
   });
 });
 
@@ -75,25 +77,25 @@ describe('calculateSkillScore', () => {
 // ============================================================================
 
 describe('calculateExperienceScore', () => {
-  it('returns 30 when candidate meets requirement', () => {
-    assert.equal(calculateExperienceScore(5, 3), 30);
+  it('returns 25 when candidate meets requirement', () => {
+    assert.equal(calculateExperienceScore(5, 3), 25);
   });
 
   it('returns 30 when candidate exactly meets requirement', () => {
-    assert.equal(calculateExperienceScore(3, 3), 30);
+    assert.equal(calculateExperienceScore(3, 3), 25);
   });
 
   it('returns 30 when candidate exceeds requirement (capped)', () => {
-    assert.equal(calculateExperienceScore(20, 3), 30);
+    assert.equal(calculateExperienceScore(20, 3), 25);
   });
 
   it('returns proportional score below requirement', () => {
-    // 2/3 * 30 = 20
-    assert.equal(calculateExperienceScore(2, 3), 20);
+    // 2/3 * 25
+    assert.ok(Math.abs(calculateExperienceScore(2, 3) - (50 / 3)) < 0.001);
   });
 
   it('returns 30 when min experience is 0', () => {
-    assert.equal(calculateExperienceScore(0, 0), 30);
+    assert.equal(calculateExperienceScore(0, 0), 25);
   });
 
   it('returns 0 for 0 experience with positive requirement', () => {
@@ -101,8 +103,55 @@ describe('calculateExperienceScore', () => {
   });
 
   it('handles partial experience correctly', () => {
-    // 1/4 * 30 = 7.5
-    assert.equal(calculateExperienceScore(1, 4), 7.5);
+    // 1/4 * 25 = 6.25
+    assert.equal(calculateExperienceScore(1, 4), 6.25);
+  });
+});
+
+describe('availability and preference alignment', () => {
+  it('awards availability points when candidate meets the start requirement', () => {
+    const result = calculateAvailabilityAlignment('Immediate', 'within_2_weeks');
+    assert.equal(result.aligned, true);
+    assert.equal(result.score, 10);
+  });
+
+  it('does not award availability points to someone not looking', () => {
+    const result = calculateAvailabilityAlignment('Not looking', 'flexible');
+    assert.equal(result.aligned, false);
+    assert.equal(result.score, 0);
+  });
+
+  it('treats unspecified availability requirements as neutral', () => {
+    const result = calculateAvailabilityAlignment('2 weeks', null);
+    assert.equal(result.aligned, null);
+    assert.equal(result.score, 10);
+  });
+
+  it('awards preference points proportionally across explicit preferences', () => {
+    const result = calculatePreferenceAlignment(
+      [
+        { dimension: 'work_arrangement', value: 'remote' },
+        { dimension: 'schedule', value: 'standard' },
+        { dimension: 'travel', value: 'frequent' },
+      ],
+      [
+        { dimension: 'work_arrangement', value: 'remote' },
+        { dimension: 'schedule', value: 'night' },
+        { dimension: 'travel', value: 'occasional' },
+      ]
+    );
+    assert.equal(result.compared, 3);
+    assert.equal(result.matched, 2);
+    assert.ok(Math.abs(result.score - (10 / 3)) < 0.001);
+  });
+
+  it('does not treat an unprovided candidate preference as a mismatch', () => {
+    const result = calculatePreferenceAlignment(
+      [],
+      [{ dimension: 'work_arrangement', value: 'remote' }]
+    );
+    assert.equal(result.compared, 0);
+    assert.equal(result.score, 5);
   });
 });
 
@@ -260,8 +309,10 @@ describe('calculateMatch', () => {
 
     const result = calculateMatch(input);
     assert.equal(result.score, 100);
-    assert.equal(result.scoreBreakdown.skillScore, 70);
-    assert.equal(result.scoreBreakdown.experienceScore, 30);
+    assert.equal(result.scoreBreakdown.skillScore, 60);
+    assert.equal(result.scoreBreakdown.experienceScore, 25);
+    assert.equal(result.scoreBreakdown.availabilityScore, 10);
+    assert.equal(result.scoreBreakdown.preferenceScore, 5);
   });
 
   it('returns zero for no overlap and no experience', () => {
@@ -272,6 +323,18 @@ describe('calculateMatch', () => {
       jobMinExperience: 5,
       semanticMappings: [],
       semanticMatchingStatus: 'enabled',
+      candidateAvailability: 'Not looking',
+      jobAvailabilityRequirement: 'immediate',
+      candidatePreferences: [
+        { dimension: 'work_arrangement', value: 'remote' },
+        { dimension: 'schedule', value: 'standard' },
+        { dimension: 'travel', value: 'none' },
+      ],
+      jobPreferences: [
+        { dimension: 'work_arrangement', value: 'on-site' },
+        { dimension: 'schedule', value: 'night' },
+        { dimension: 'travel', value: 'frequent' },
+      ],
     };
 
     const result = calculateMatch(input);
@@ -289,8 +352,8 @@ describe('calculateMatch', () => {
     };
 
     const result = calculateMatch(input);
-    // 70 + (1/3 * 30) = 70 + 10 = 80
-    assert.equal(result.score, 80);
+    // 60 skill + 25/3 experience + 10 neutral availability + 5 neutral preferences
+    assert.ok(Math.abs(result.score - (60 + (25 / 3) + 15)) < 0.001);
     assert.equal(result.experience.meetsRequirement, false);
   });
 
@@ -306,8 +369,8 @@ describe('calculateMatch', () => {
 
     const result = calculateMatch(input);
     assert.equal(result.scoreBreakdown.skillScore, 0);
-    assert.equal(result.scoreBreakdown.experienceScore, 30);
-    assert.equal(result.score, 30);
+    assert.equal(result.scoreBreakdown.experienceScore, 25);
+    assert.equal(result.score, 40);
   });
 
   it('score is bounded between 0 and 100', () => {
@@ -396,7 +459,7 @@ describe('calculateMatch', () => {
     };
 
     const result = calculateMatch(input);
-    assert.equal(result.scoreBreakdown.experienceScore, 30);
+    assert.equal(result.scoreBreakdown.experienceScore, 25);
   });
 
   it('empty required skills returns zero skill score', () => {
@@ -411,7 +474,7 @@ describe('calculateMatch', () => {
 
     const result = calculateMatch(input);
     assert.equal(result.scoreBreakdown.skillScore, 0);
-    assert.equal(result.score, 30);
+    assert.equal(result.score, 40);
   });
 });
 

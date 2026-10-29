@@ -11,7 +11,13 @@
  * Both endpoints use this single service to ensure consistent scoring.
  */
 
-import type { MatchingRepository, CandidateWithSkills, JobWithSkills } from '../repositories/matching.repository.js';
+import type {
+  MatchingRepository,
+  CandidateWithSkills,
+  JobWithSkills,
+  CandidatePreference,
+  JobPreference,
+} from '../repositories/matching.repository.js';
 import type { SemanticMatchingService } from './semantic-matching.service.js';
 import { calculateMatch, normalizeSkillLabel, roundScore, type MatchResult, type SemanticMapping } from './scoring.js';
 
@@ -23,14 +29,12 @@ export interface JobMatchResult {
   candidateId: number;
   candidateName: string;
   score: number;
-  scoreBreakdown: {
-    skillScore: number;
-    experienceScore: number;
-  };
-  skills: MatchResult['skills'];
-  experience: MatchResult['experience'];
-  semanticMatching: MatchResult['semanticMatching'];
   reason: string;
+}
+
+interface RankedJobMatch extends JobMatchResult {
+  rankingScore: number;
+  matchedSkills: number;
 }
 
 export interface JobMatchesResponse {
@@ -43,15 +47,15 @@ export interface CandidateJobMatchResult {
   jobId: number;
   jobTitle: string;
   score: number;
-  scoreBreakdown: {
-    skillScore: number;
-    experienceScore: number;
-  };
-  skills: MatchResult['skills'];
-  experience: MatchResult['experience'];
-  semanticMatching: MatchResult['semanticMatching'];
   reason: string;
 }
+
+interface RankedCandidateJobMatch extends CandidateJobMatchResult {
+  rankingScore: number;
+  matchedSkills: number;
+}
+
+const SCORE_TIE_TOLERANCE = 1e-9;
 
 export interface CandidateMatchesResponse {
   candidateId: number;
@@ -81,18 +85,30 @@ export class MatchingService {
     }
 
     const jobSkills = await this.repository.getJobRequiredSkills(jobId);
+    const jobPreferences = await this.repository.getJobPreferences(jobId);
 
     // 2. Get all candidates with skills (batch query)
     const candidates = await this.repository.getAllCandidatesWithSkills();
 
     // 3. Score each candidate
-    const scoredCandidates = await Promise.all(
+    const scoredCandidates: RankedJobMatch[] = await Promise.all(
       candidates.map(async (candidate) => {
-        const result = await this.scoreCandidate(candidate.skills, jobSkills, candidate.experience, job.minExperience);
+        const result = await this.scoreCandidate(
+          candidate.skills,
+          jobSkills,
+          candidate.experience,
+          job.minExperience,
+          candidate.availability,
+          job.availabilityRequirement,
+          candidate.preferences,
+          jobPreferences
+        );
+        const { matchedSkills, ...match } = result;
         return {
           candidateId: candidate.id,
           candidateName: candidate.name,
-          ...result,
+          ...match,
+          matchedSkills,
         };
       })
     );
@@ -103,7 +119,12 @@ export class MatchingService {
     return {
       jobId: job.id,
       jobTitle: job.title,
-      matches: ranked,
+      matches: ranked.map(({ candidateId, candidateName, score, reason }) => ({
+        candidateId,
+        candidateName,
+        score,
+        reason,
+      })),
     };
   }
 
@@ -119,18 +140,30 @@ export class MatchingService {
     }
 
     const candidateSkills = await this.repository.getCandidateSkills(candidateId);
+    const candidatePreferences = await this.repository.getCandidatePreferences(candidateId);
 
     // 2. Get all jobs with skills (batch query)
     const jobs = await this.repository.getAllJobsWithSkills();
 
     // 3. Score each job
-    const scoredJobs = await Promise.all(
+    const scoredJobs: RankedCandidateJobMatch[] = await Promise.all(
       jobs.map(async (job) => {
-        const result = await this.scoreCandidate(candidateSkills, job.requiredSkills, candidate.experience, job.minExperience);
+        const result = await this.scoreCandidate(
+          candidateSkills,
+          job.requiredSkills,
+          candidate.experience,
+          job.minExperience,
+          candidate.availability,
+          job.availabilityRequirement,
+          candidatePreferences,
+          job.preferences
+        );
+        const { matchedSkills, ...match } = result;
         return {
           jobId: job.id,
           jobTitle: job.title,
-          ...result,
+          ...match,
+          matchedSkills,
         };
       })
     );
@@ -141,7 +174,12 @@ export class MatchingService {
     return {
       candidateId: candidate.id,
       candidateName: candidate.name,
-      matches: ranked,
+      matches: ranked.map(({ jobId, jobTitle, score, reason }) => ({
+        jobId,
+        jobTitle,
+        score,
+        reason,
+      })),
     };
   }
 
@@ -155,13 +193,15 @@ export class MatchingService {
     candidateSkills: string[],
     jobRequiredSkills: string[],
     candidateExperience: number,
-    jobMinExperience: number
+    jobMinExperience: number,
+    candidateAvailability: string,
+    jobAvailabilityRequirement: string | null,
+    candidatePreferences: CandidatePreference[],
+    jobPreferences: JobPreference[]
   ): Promise<{
     score: number;
-    scoreBreakdown: { skillScore: number; experienceScore: number };
-    skills: MatchResult['skills'];
-    experience: MatchResult['experience'];
-    semanticMatching: MatchResult['semanticMatching'];
+    rankingScore: number;
+    matchedSkills: number;
     reason: string;
   }> {
     // Find exact matches to determine unresolved skills
@@ -207,45 +247,46 @@ export class MatchingService {
       jobMinExperience,
       semanticMappings: semanticResult.mappings,
       semanticMatchingStatus: semanticResult.status,
+      candidateAvailability,
+      jobAvailabilityRequirement,
+      candidatePreferences,
+      jobPreferences,
     });
 
     return {
       score: roundScore(matchResult.score),
-      scoreBreakdown: {
-        skillScore: roundScore(matchResult.scoreBreakdown.skillScore),
-        experienceScore: roundScore(matchResult.scoreBreakdown.experienceScore),
-      },
-      skills: matchResult.skills,
-      experience: matchResult.experience,
-      semanticMatching: matchResult.semanticMatching,
+      rankingScore: matchResult.score,
+      matchedSkills: matchResult.skills.matched,
       reason: matchResult.reason,
     };
   }
 
   /**
    * Rank candidates for a job:
-   * 1. Total score descending
+   * 1. Full-precision total score descending (display rounding does not affect rank)
    * 2. Number of matched required skills descending
    * 3. Candidate ID ascending
    */
-  private rankCandidates(candidates: JobMatchResult[]): JobMatchResult[] {
+  private rankCandidates(candidates: RankedJobMatch[]): RankedJobMatch[] {
     return candidates.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      if (b.skills.matched !== a.skills.matched) return b.skills.matched - a.skills.matched;
+      const scoreDifference = b.rankingScore - a.rankingScore;
+      if (Math.abs(scoreDifference) > SCORE_TIE_TOLERANCE) return scoreDifference;
+      if (b.matchedSkills !== a.matchedSkills) return b.matchedSkills - a.matchedSkills;
       return a.candidateId - b.candidateId;
     });
   }
 
   /**
    * Rank jobs for a candidate:
-   * 1. Total score descending
+   * 1. Full-precision total score descending (display rounding does not affect rank)
    * 2. Number of matched required skills descending
    * 3. Job ID ascending
    */
-  private rankJobs(jobs: CandidateJobMatchResult[]): CandidateJobMatchResult[] {
+  private rankJobs(jobs: RankedCandidateJobMatch[]): RankedCandidateJobMatch[] {
     return jobs.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      if (b.skills.matched !== a.skills.matched) return b.skills.matched - a.skills.matched;
+      const scoreDifference = b.rankingScore - a.rankingScore;
+      if (Math.abs(scoreDifference) > SCORE_TIE_TOLERANCE) return scoreDifference;
+      if (b.matchedSkills !== a.matchedSkills) return b.matchedSkills - a.matchedSkills;
       return a.jobId - b.jobId;
     });
   }
@@ -261,4 +302,3 @@ export class NotFoundError extends Error {
     this.name = 'NotFoundError';
   }
 }
-

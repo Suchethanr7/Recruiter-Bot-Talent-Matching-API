@@ -5,8 +5,10 @@
  * All functions are pure: given the same inputs, they always produce the same outputs.
  *
  * Scoring weights (transparent baseline, not empirically optimized):
- *   - Skill matching:  70 points (70%)
- *   - Experience fit:  30 points (30%)
+ *   - Skill matching:  60 points (60%)
+ *   - Experience fit:  25 points (25%)
+ *   - Availability alignment: 10 points (10%)
+ *   - Job-related preferences: 5 points (5%)
  *   - Total:          100 points
  */
 
@@ -47,6 +49,8 @@ export interface SemanticMatchingStatus {
 export interface ScoreBreakdown {
   skillScore: number;
   experienceScore: number;
+  availabilityScore: number;
+  preferenceScore: number;
 }
 
 export interface MatchResult {
@@ -55,6 +59,8 @@ export interface MatchResult {
   skills: SkillMatchResult;
   experience: ExperienceResult;
   semanticMatching: SemanticMatchingStatus;
+  availabilityAlignment: AvailabilityAlignment;
+  preferenceAlignment: PreferenceAlignment;
   reason: string;
 }
 
@@ -71,14 +77,51 @@ export interface ScoringInput {
   jobMinExperience: number;
   semanticMappings: SemanticMapping[];
   semanticMatchingStatus: 'enabled' | 'disabled' | 'unavailable';
+  candidateAvailability?: string | null;
+  jobAvailabilityRequirement?: string | null;
+  candidatePreferences?: CandidatePreference[];
+  jobPreferences?: JobPreference[];
 }
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const SKILL_WEIGHT = 70;
-const EXPERIENCE_WEIGHT = 30;
+const SKILL_WEIGHT = 60;
+const EXPERIENCE_WEIGHT = 25;
+const AVAILABILITY_WEIGHT = 10;
+const PREFERENCE_WEIGHT = 5;
+
+export type PreferenceDimension = 'work_arrangement' | 'schedule' | 'travel';
+
+export interface JobPreference {
+  dimension: PreferenceDimension;
+  value: string;
+}
+
+export interface CandidatePreference {
+  dimension: PreferenceDimension;
+  value: string;
+}
+
+export interface AvailabilityAlignment {
+  candidateAvailability: string | null;
+  jobRequirement: string | null;
+  aligned: boolean | null;
+  score: number;
+}
+
+export interface PreferenceAlignment {
+  compared: number;
+  matched: number;
+  score: number;
+  matches: Array<{
+    dimension: PreferenceDimension;
+    candidateValue: string;
+    jobRequirement: string;
+    matched: boolean;
+  }>;
+}
 
 // ============================================================================
 // Normalization
@@ -231,6 +274,97 @@ export function calculateExperienceScore(candidateExp: number, jobMinExp: number
   return EXPERIENCE_WEIGHT * Math.min(candidateExp / jobMinExp, 1);
 }
 
+export function calculateAvailabilityAlignment(
+  candidateAvailability: string | null | undefined,
+  jobRequirement: string | null | undefined
+): AvailabilityAlignment {
+  if (!candidateAvailability || !jobRequirement) {
+    return {
+      candidateAvailability: candidateAvailability ?? null,
+      jobRequirement: jobRequirement ?? null,
+      aligned: null,
+      score: AVAILABILITY_WEIGHT,
+    };
+  }
+
+  const candidate = candidateAvailability.trim().toLowerCase();
+  const requirement = jobRequirement.trim().toLowerCase();
+  const available = candidate === 'immediate' || candidate === '2 weeks';
+  let aligned = false;
+
+  if (requirement === 'flexible') {
+    aligned = available;
+  } else if (requirement === 'within_2_weeks') {
+    aligned = candidate === 'immediate' || candidate === '2 weeks';
+  } else if (requirement === 'immediate') {
+    aligned = candidate === 'immediate';
+  } else {
+    throw new Error(`Unsupported job availability requirement: "${jobRequirement}"`);
+  }
+
+  return {
+    candidateAvailability,
+    jobRequirement,
+    aligned,
+    score: aligned ? AVAILABILITY_WEIGHT : 0,
+  };
+}
+
+function isPreferenceCompatible(
+  dimension: PreferenceDimension,
+  candidateValue: string,
+  jobRequirement: string
+): boolean {
+  const candidate = candidateValue.trim().toLowerCase();
+  const requirement = jobRequirement.trim().toLowerCase();
+
+  if (candidate === 'flexible' || requirement === 'flexible' || requirement === 'any') {
+    return true;
+  }
+
+  if (dimension === 'travel') {
+    const willingness: Record<string, number> = {
+      none: 0,
+      occasional: 1,
+      frequent: 2,
+    };
+    const required = willingness[requirement];
+    const offered = willingness[candidate];
+    if (required === undefined || offered === undefined) {
+      throw new Error(`Unsupported travel preference: candidate="${candidateValue}", job="${jobRequirement}"`);
+    }
+    return offered >= required;
+  }
+
+  return candidate === requirement;
+}
+
+export function calculatePreferenceAlignment(
+  candidatePreferences: CandidatePreference[] = [],
+  jobPreferences: JobPreference[] = []
+): PreferenceAlignment {
+  const candidateValues = new Map(candidatePreferences.map(({ dimension, value }) => [dimension, value]));
+  const matches = jobPreferences.flatMap(({ dimension, value: jobRequirement }) => {
+    const candidateValue = candidateValues.get(dimension);
+    if (candidateValue === undefined) return [];
+    return [{
+      dimension,
+      candidateValue,
+      jobRequirement,
+      matched: isPreferenceCompatible(dimension, candidateValue, jobRequirement),
+    }];
+  });
+
+  const compared = matches.length;
+  const matched = matches.filter(match => match.matched).length;
+  return {
+    compared,
+    matched,
+    score: compared === 0 ? PREFERENCE_WEIGHT : PREFERENCE_WEIGHT * (matched / compared),
+    matches,
+  };
+}
+
 /**
  * Generate a human-readable explanation of the match.
  * Built from actual calculation data — never hardcoded per candidate.
@@ -321,9 +455,18 @@ export function calculateMatch(input: ScoringInput): MatchResult {
     input.candidateExperience,
     input.jobMinExperience
   );
+  const availabilityAlignment = calculateAvailabilityAlignment(
+    input.candidateAvailability,
+    input.jobAvailabilityRequirement
+  );
+  const preferenceAlignment = calculatePreferenceAlignment(
+    input.candidatePreferences,
+    input.jobPreferences
+  );
 
   // 3. Total score (keep full precision internally)
-  const totalScore = skillScore + experienceScore;
+  const totalScore = skillScore + experienceScore +
+    availabilityAlignment.score + preferenceAlignment.score;
 
   // 4. Experience details
   const experienceResult: ExperienceResult = {
@@ -346,10 +489,14 @@ export function calculateMatch(input: ScoringInput): MatchResult {
     scoreBreakdown: {
       skillScore,
       experienceScore,
+      availabilityScore: availabilityAlignment.score,
+      preferenceScore: preferenceAlignment.score,
     },
     skills: skillResult,
     experience: experienceResult,
     semanticMatching: semanticStatus,
+    availabilityAlignment,
+    preferenceAlignment,
     reason,
   };
 }
@@ -361,4 +508,3 @@ export function calculateMatch(input: ScoringInput): MatchResult {
 export function roundScore(score: number): number {
   return Math.round(score * 10) / 10;
 }
-
